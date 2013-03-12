@@ -15,10 +15,14 @@ along with this program; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
 MA 02110-1301, USA.
 */
-
+#include <yajl/YAJLDom.h>
 #include <mavsprintf.h>
 
 #include <MAUtil/GLMoblet.h>
+
+#include <mautil/connection.h>
+
+
 #include <GLES2/gl2.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -32,12 +36,15 @@ MA 02110-1301, USA.
 #include "MAHeaders.h"
 #include "DTime.h"
 #include "Touch.h"
+
+#define CONNECTION_BUFFER_SIZE 1024
+
 using namespace MAUtil;
 
 
 // TODO HANDLE RENDERTEXT in Y aswell we might need to get hold of min/max Y...
 
-class MyGLMoblet: public GLMoblet
+class MyGLMoblet: public GLMoblet, MAUtil::HttpConnectionListener
 {
 private:
 	// Bars location parameters
@@ -51,6 +58,12 @@ private:
 	Time  			mTime;				// elapsed time since creation of this class,
 	RenderText 		mText;
 
+	MAUtil::HttpConnection mHttp;
+	char *mBuffer;
+
+	char *mSharesData;
+	int mTotalSize;
+
 
 public:
 
@@ -58,7 +71,7 @@ public:
 	 * Constructor for the main app class
 	 */
 	MyGLMoblet() :
-		GLMoblet(GLMoblet::GL2) , mGraph(0), mFont(0), mColors(0), mTables(0)
+		GLMoblet(GLMoblet::GL2) , mGraph(0), mFont(0), mColors(0), mTables(0), mHttp(this)
 	{
 	}
 
@@ -73,6 +86,113 @@ public:
 		delete mFont;					// Deleta Font
 	}
 
+	void httpFinished(HttpConnection *conn, int result)
+	{
+
+		if( result < 0){
+			lprintfln("@@@ 3DGRAPH: Cannot connect");
+		} else {
+
+			lprintfln("@@@ 3DGRAPH: HTTP %i\n", result);
+			MAUtil::String contentLengthStr;
+			int responseBytes = mHttp.getResponseHeader("content-length", &contentLengthStr);
+			int contentLength = 0;
+			if(responseBytes == CONNERR_NOHEADER)
+				lprintfln("@@@ 3DGRAPH: no content-length response header\n");
+			else {
+				lprintfln("@@@ 3DGRAPH: content-length: %s\n", contentLengthStr.c_str());
+				contentLength = atoi(contentLengthStr.c_str());
+			}
+
+			if(contentLength >= CONNECTION_BUFFER_SIZE || contentLength == 0) {
+				lprintfln("@@@ 3DGRAPH: Receive in chunks..\n");
+				mBuffer = (char*)malloc(CONNECTION_BUFFER_SIZE*sizeof(char));
+				mHttp.recv(mBuffer, CONNECTION_BUFFER_SIZE);
+			} else {
+				mBuffer = (char*)malloc(contentLength*sizeof(char));
+				mBuffer[contentLength] = 0;
+				mHttp.read(mBuffer, contentLength);
+			}
+		}
+	}
+
+	void connRecvFinished(Connection *conn, int result)
+	{
+		if(result >= 0) {
+			lprintfln("@@@ 3DGRAPH: connRecvFinished %i\n", result);
+			//lprintfln("@@@ 3DGRAPH DATA: %s", mBuffer);
+			//lprintfln("@@@@@@@@@@@@@@@ FIRST:%s", mBuffer[2]);
+			if(this->mSharesData == NULL){
+				this->mSharesData = (char*)malloc((result-3)*sizeof(char));
+				lprintfln("@@@@@@@@@@@@@@@ size: %d", (int)strlen(mSharesData));
+				this->mTotalSize = result-4;
+
+				for(int i = 4; i < result; i++)
+					this->mSharesData[i-4] = mBuffer[i];
+
+				mSharesData[mTotalSize] = '\0';
+				lprintfln("@@@@@@@@@@@@@@@ FIRST:%sLAST size: %d", mSharesData, (int)strlen(mSharesData));
+
+				//realloc(this->mSharesData ,(this->mTotalSize+result)*sizeof(char));
+				//memcpy(this->mSharesData, mBuffer, result);
+
+			} else {
+				mBuffer[result] = '\0';
+				lprintfln("@@@@@@@@@@@@@@@ FIRST:%sLAST size: %d", mBuffer, (int)strlen(mBuffer));
+				realloc(mSharesData ,(mTotalSize+result)*sizeof(char));
+				mTotalSize += result;
+				strcat(mSharesData, mBuffer);
+
+				parseJSON();
+			}
+			// Clear mBuffer;
+			free(mBuffer);
+			mBuffer = (char*)malloc(CONNECTION_BUFFER_SIZE*sizeof(char));
+			mHttp.recv(mBuffer, CONNECTION_BUFFER_SIZE);
+			return;
+		}
+		else if(result == CONNERR_CLOSED) {
+			lprintfln("@@@ 3DGRAPH: Receive finished!\n");
+			//lprintfln("@@@ 3DGRAPH DATA: %s", mSharesData);
+		}
+		else {
+			lprintfln("@@@ 3DGRAPH: connection error %i\n", result);
+		}
+		mHttp.close();
+		//mIsConnected = false;
+
+		// TODO: Populate Data tables
+		//populateDataTables
+	}
+
+	void parseJSON() {
+		MAUtil::String tmp = "{ \"hello\":\"world\"}";
+		YAJLDom::Value *jsonRoot = YAJLDom::parse((const unsigned char*)tmp.c_str(), tmp.size());
+
+		if(jsonRoot->getType() == YAJLDom::Value::ARRAY) {
+			lprintfln("SUCCESS IN PARSING JSON DATA");
+		}
+	}
+
+	void connReadFinished(Connection *conn, int result)
+	{
+		this->mSharesData = (char*)malloc(result*sizeof(char));
+		this->mTotalSize = result;
+		memcpy(this->mSharesData, mBuffer, result);
+
+		if(result >= 0){
+			//lprintfln("@@@ 3DGRAPH: connReadFinished %i\n", result);
+			lprintfln("@@@ 3DGRAPH DATA: %s", mSharesData);
+		}
+		else
+			lprintfln("@@@ 3DGRAPH: connection error %i\n", result);
+		mHttp.close();
+
+		//mIsConnected = false;
+
+		// TODO: Populate Data tables
+		// populateDataTables
+	}
 	/**
 	 * This method is called when a key is pressed.
 	 */
@@ -123,6 +243,18 @@ public:
 	 */
 	void init()
 	{
+		this->mSharesData = NULL;
+		lprintfln("@@@ MOSYNC BEFORE REQUEST");
+		MAUtil::String url = "http://finance.google.com/finance/info?client=ig&q=NASDAQ:GOOG,NASDAQ:MSFT,NASDAQ:AEZS,NASDAQ:PAMT,NASDAQ:AEHR,NASDAQ:BTUI";
+
+		int res = mHttp.create(url.c_str(),HTTP_GET);
+		if(res < 0) {
+			lprintfln("@@@@@@@@@@@@@@@@ unable to connect - %i\n", res);
+		} else {
+			mHttp.finish();
+		}
+		//mHttp.create("http://www.example.com", HTTP_GET);
+
 		/*
 		 * *Graph object needs to be allocated and then initiated,
 		 * *Font is a separate system but is required in the graph for rendering text in 3D
@@ -137,7 +269,7 @@ public:
 		mGraph 		= new MoGraph::Graph();			// Create MoGraph::Graph class
 		mFont 		= new BMFont();					// Create Font class
 
-		int grid 	= 33;							// set up a desired grid for the graph in X & Z.
+		int grid 	= 10;							// set up a desired grid for the graph in X & Z.
 		lprintfln("mGrid: %i", grid);
 
 		std::vector<MAHandle> fontTexArray;
@@ -157,7 +289,7 @@ public:
 		setPreferredFramesPerSecond(50);			// set preferred fps for the Moblet
 
 		// initiate Graph by setting up a grid sz in X & Z , also grid in Y with grid step, additional info like fit to screen, screen resolutions.
-		if (!mGraph->init(grid,grid,gridLines,gridStepY,true,mFont,mWidth,mHeight))	// initiate Graph with parameters as GridX, GridY, amount of gridLines in Y, stepping for each grid line in Y, fit to screen, Font class, screen width and screen height
+		if (!mGraph->init(grid,1,gridLines,gridStepY,true,mFont,mWidth,mHeight))	// initiate Graph with parameters as GridX, GridY, amount of gridLines in Y, stepping for each grid line in Y, fit to screen, Font class, screen width and screen height
 			maPanic(1,"Failed to initiate Graph");
 
 		mGraph->setBKColor(bkcolor);				// additional set background color
